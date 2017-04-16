@@ -1,6 +1,11 @@
 #include <QtGui>
 #include <QtDebug>
+#include <QTextCursor>
+#include <algorithm>
 #include "hgmarkdownhighlighter.h"
+#include "vconfigmanager.h"
+
+extern VConfigManager vconfig;
 
 const int HGMarkdownHighlighter::initCapacity = 1024;
 
@@ -18,13 +23,16 @@ void HGMarkdownHighlighter::resizeBuffer(int newCap)
 }
 
 // Will be freeed by parent automatically
-HGMarkdownHighlighter::HGMarkdownHighlighter(const QVector<HighlightingStyle> &styles, int waitInterval,
+HGMarkdownHighlighter::HGMarkdownHighlighter(const QVector<HighlightingStyle> &styles,
+                                             const QMap<QString, QTextCharFormat> &codeBlockStyles,
+                                             int waitInterval,
                                              QTextDocument *parent)
-    : QSyntaxHighlighter(parent), parsing(0),
-      waitInterval(waitInterval), content(NULL), capacity(0), result(NULL)
+    : QSyntaxHighlighter(parent), highlightingStyles(styles),
+      m_codeBlockStyles(codeBlockStyles), m_numOfCodeBlockHighlightsToRecv(0),
+      parsing(0), waitInterval(waitInterval), content(NULL), capacity(0), result(NULL)
 {
-    codeBlockStartExp = QRegExp("^(\\s)*```");
-    codeBlockEndExp = QRegExp("^(\\s)*```$");
+    codeBlockStartExp = QRegExp("^\\s*```(\\S*)");
+    codeBlockEndExp = QRegExp("^\\s*```$");
     codeBlockFormat.setForeground(QBrush(Qt::darkYellow));
     for (int index = 0; index < styles.size(); ++index) {
         const pmh_element_type &eleType = styles[index].type;
@@ -38,7 +46,6 @@ HGMarkdownHighlighter::HGMarkdownHighlighter(const QVector<HighlightingStyle> &s
     }
 
     resizeBuffer(initCapacity);
-    setStyles(styles);
     document = parent;
     timer = new QTimer(this);
     timer->setSingleShot(true);
@@ -65,10 +72,10 @@ void HGMarkdownHighlighter::highlightBlock(const QString &text)
 {
     int blockNum = currentBlock().blockNumber();
     if (!parsing && blockHighlights.size() > blockNum) {
-        QVector<HLUnit> &units = blockHighlights[blockNum];
+        const QVector<HLUnit> &units = blockHighlights[blockNum];
         for (int i = 0; i < units.size(); ++i) {
             // TODO: merge two format within the same range
-            const HLUnit& unit = units[i];
+            const HLUnit &unit = units[i];
             setFormat(unit.start, unit.length, highlightingStyles[unit.styleIndex].format);
         }
     }
@@ -82,11 +89,18 @@ void HGMarkdownHighlighter::highlightBlock(const QString &text)
 
     // PEG Markdown Highlight does not handle links with spaces in the URL.
     highlightLinkWithSpacesInURL(text);
-}
 
-void HGMarkdownHighlighter::setStyles(const QVector<HighlightingStyle> &styles)
-{
-    this->highlightingStyles = styles;
+    // Highlight CodeBlock using VCodeBlockHighlightHelper.
+    if (m_codeBlockHighlights.size() > blockNum) {
+        const QVector<HLUnitStyle> &units = m_codeBlockHighlights[blockNum];
+        for (int i = 0; i < units.size(); ++i) {
+            const HLUnitStyle &unit = units[i];
+            auto it = m_codeBlockStyles.find(unit.style);
+            if (it != m_codeBlockStyles.end()) {
+                setFormat(unit.start, unit.length, *it);
+            }
+        }
+    }
 }
 
 void HGMarkdownHighlighter::initBlockHighlightFromResult(int nrBlocks)
@@ -286,7 +300,9 @@ void HGMarkdownHighlighter::handleContentChange(int /* position */, int charsRem
 void HGMarkdownHighlighter::timerTimeout()
 {
     parse();
-    rehighlight();
+    if (!updateCodeBlocks()) {
+        rehighlight();
+    }
     emit highlightCompleted();
 }
 
@@ -294,4 +310,115 @@ void HGMarkdownHighlighter::updateHighlight()
 {
     timer->stop();
     timerTimeout();
+}
+
+bool HGMarkdownHighlighter::updateCodeBlocks()
+{
+    if (!vconfig.getEnableCodeBlockHighlight()) {
+        return false;
+    }
+
+    m_codeBlockHighlights.resize(document->blockCount());
+    for (int i = 0; i < m_codeBlockHighlights.size(); ++i) {
+        m_codeBlockHighlights[i].clear();
+    }
+
+    QList<VCodeBlock> codeBlocks;
+
+    VCodeBlock item;
+    bool inBlock = false;
+
+    // Only handle complete codeblocks.
+    QTextBlock block = document->firstBlock();
+    while (block.isValid()) {
+        QString text = block.text();
+        if (inBlock) {
+            item.m_text = item.m_text + "\n" + text;
+            int idx = codeBlockEndExp.indexIn(text);
+            if (idx >= 0) {
+                // End block.
+                inBlock = false;
+                item.m_endBlock = block.blockNumber();
+                codeBlocks.append(item);
+            }
+        } else {
+            int idx = codeBlockStartExp.indexIn(text);
+            if (idx >= 0) {
+                // Start block.
+                inBlock = true;
+                item.m_startBlock = block.blockNumber();
+                item.m_startPos = block.position();
+                item.m_text = text;
+                if (codeBlockStartExp.captureCount() == 1) {
+                    item.m_lang = codeBlockStartExp.capturedTexts()[1];
+                }
+            }
+        }
+        block = block.next();
+    }
+
+    m_numOfCodeBlockHighlightsToRecv = codeBlocks.size();
+    if (m_numOfCodeBlockHighlightsToRecv > 0) {
+        emit codeBlocksUpdated(codeBlocks);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static bool HLUnitStyleComp(const HLUnitStyle &a, const HLUnitStyle &b)
+{
+    if (a.start < b.start) {
+        return true;
+    } else if (a.start == b.start) {
+        return a.length > b.length;
+    } else {
+        return false;
+    }
+}
+
+void HGMarkdownHighlighter::setCodeBlockHighlights(const QList<HLUnitPos> &p_units)
+{
+    QVector<QVector<HLUnitStyle>> highlights(m_codeBlockHighlights.size());
+
+    for (auto const &unit : p_units) {
+        int pos = unit.m_position;
+        int end = unit.m_position + unit.m_length;
+        int startBlockNum = document->findBlock(pos).blockNumber();
+        int endBlockNum = document->findBlock(end).blockNumber();
+        for (int i = startBlockNum; i <= endBlockNum; ++i)
+        {
+            QTextBlock block = document->findBlockByNumber(i);
+            int blockStartPos = block.position();
+            HLUnitStyle hl;
+            hl.style = unit.m_style;
+            if (i == startBlockNum) {
+                hl.start = pos - blockStartPos;
+                hl.length = (startBlockNum == endBlockNum) ?
+                                (end - pos) : (block.length() - hl.start);
+            } else if (i == endBlockNum) {
+                hl.start = 0;
+                hl.length = end - blockStartPos;
+            } else {
+                hl.start = 0;
+                hl.length = block.length();
+            }
+
+            highlights[i].append(hl);
+        }
+    }
+
+    // Need to highlight in order.
+    for (int i = 0; i < highlights.size(); ++i) {
+        QVector<HLUnitStyle> &units = highlights[i];
+        if (!units.isEmpty()) {
+            std::sort(units.begin(), units.end(), HLUnitStyleComp);
+            m_codeBlockHighlights[i].append(units);
+        }
+    }
+
+    --m_numOfCodeBlockHighlightsToRecv;
+    if (m_numOfCodeBlockHighlightsToRecv == 0) {
+        rehighlight();
+    }
 }

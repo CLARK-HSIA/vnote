@@ -13,6 +13,11 @@ new QWebChannel(qt.webChannelTransport,
             content.updateText();
         }
         content.requestScrollToAnchor.connect(scrollToAnchor);
+
+        if (typeof highlightText == "function") {
+            content.setLog("connect highlight text");
+            content.requestHighlightText.connect(highlightText);
+        }
     });
 
 var VMermaidDivClass = 'mermaid-diagram';
